@@ -117,6 +117,18 @@
     background: var(--primary); color: var(--primary-ink); font-weight: 800; padding: 10px 16px; border-radius: 999px; transition: .25s; z-index: 60; white-space: nowrap; }
   .toast.on { opacity: 1; transform: translate(-50%, 0); }
 
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chips button { background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 6px 11px; font-size: 13px; font-weight: 600; }
+  .chips button.on { background: var(--primary); color: var(--primary-ink); border-color: var(--primary); }
+  .cat { margin-left: 6px; padding: 2px 8px; border-radius: 999px; background: var(--primary); color: var(--primary-ink); letter-spacing: 0; }
+  .cat:empty { display: none; }
+  .list .c { display: inline-block; font-size: 11px; font-weight: 800; color: var(--primary); border: 1px solid var(--primary-line); border-radius: 999px; padding: 0 7px; margin-right: 6px; vertical-align: 2px; }
+  .mapping { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 12px; font-size: 13px; color: var(--muted); }
+  .mapping summary { cursor: pointer; font-weight: 700; color: var(--text); }
+  .mapping table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+  .mapping td { padding: 5px 4px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .mapping td:first-child { color: var(--primary); font-weight: 800; width: 44px; }
+  .mapping p { margin: 8px 0 0; }
   .hidden { display: none !important; }
   a.sheet { color: var(--primary); font-size: 13px; font-weight: 700; text-decoration: none; }
 </style>
@@ -179,12 +191,18 @@
       <div class="note warn hidden" id="pastNote"></div>
 
       <div class="preview" style="margin: 4px 0 18px">
-        <div class="tag">주간바자 미리보기</div>
+        <div class="tag">주간바자 미리보기 <span id="pvCat" class="cat"></span></div>
         <div class="t" id="pvTitle"></div>
         <div class="l" id="pvDate"></div>
         <div class="l" id="pvVenue"></div>
       </div>
 
+      <div class="field" data-k="category">
+        <label>카테고리</label>
+        <input data-f="category" list="catList" autocomplete="off">
+        <datalist id="catList"></datalist>
+        <div class="chips" id="catChips"></div>
+      </div>
       <div class="grid2">
         <div class="field" data-k="host"><label>주최</label><input data-f="host"></div>
         <div class="field" data-k="organizer"><label>주관</label><input data-f="organizer"></div>
@@ -206,11 +224,12 @@
         <div class="field" data-k="venue"><label>장소</label><input data-f="venue"></div>
         <div class="field" data-k="region"><label>지역</label><input data-f="region" placeholder="서울 마포구"></div>
       </div>
-      <div class="field" data-k="details"><label>세부내용</label><textarea data-f="details" style="min-height:150px"></textarea></div>
+      <div class="field" data-k="summary"><label>내용</label><textarea data-f="summary" style="min-height:80px"></textarea></div>
+      <div class="field" data-k="details"><label>세부내용</label><textarea data-f="details" style="min-height:140px"></textarea></div>
       <div class="field">
         <label>발행호 (목요일)</label>
         <input type="date" data-f="issue">
-        <div class="hint">등록한 날 기준 다음 목요일 발행호로 자동 지정돼요. 필요하면 바꾸세요.</div>
+        <div class="hint">등록한 날 기준 다음 목요일 발행호로 자동 지정돼요. '주간바자 정리' 시트가 이 날짜로 묶여요.</div>
       </div>
       <button class="btn-text" id="resetBtn" type="button">처음부터 다시</button>
     </section>
@@ -222,6 +241,10 @@
         <a class="sheet" id="sheetLink" target="_blank" rel="noopener">시트 열기 ↗</a>
       </h2>
       <ul class="list" id="list"></ul>
+      <details class="mapping" id="mapping">
+        <summary>바자가자 시트 연결 상태</summary>
+        <div id="mapBody"></div>
+      </details>
     </section>
   </main>
 </div>
@@ -238,7 +261,7 @@
 <script>
   var NEEDS_PASSCODE = <?= needsPasscode ? 'true' : 'false' ?>;
   var WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토'];
-  var state = { passcode: '', image: null, event: null, mode: 'input' };
+  var state = { passcode: '', image: null, event: null, mode: 'input', categories: [] };
 
   function $(id) { return document.getElementById(id); }
   function show(el, on) { el.classList.toggle('hidden', !on); }
@@ -321,16 +344,59 @@
     $('issueChip').textContent = d.issueLabel + ' 발행 · ' + d.events.length + '건';
     $('listTitle').textContent = d.issueLabel + ' 주간바자';
     $('sheetLink').href = d.sheetUrl;
+    setCategories(d.categories);
+    renderMapping(d.mapping);
     var ul = $('list'); ul.innerHTML = '';
     if (!d.events.length) { ul.innerHTML = '<li class="empty">아직 이번 호에 등록된 행사가 없어요.</li>'; return; }
     d.events.forEach(function (ev) {
       var li = document.createElement('li');
-      li.innerHTML = '<div class="t"></div><div class="m"></div>' + (ev.link ? '<a target="_blank" rel="noopener">게시물 보기 ↗</a>' : '');
+      li.innerHTML = '<div><span class="c"></span><span class="t"></span></div><div class="m"></div>' + (ev.link ? '<a target="_blank" rel="noopener">게시물 보기 ↗</a>' : '');
       li.querySelector('.t').textContent = ev.title || '(행사명 없음)';
+      var c = li.querySelector('.c'); if (ev.category) c.textContent = ev.category; else c.remove();
       li.querySelector('.m').textContent = [ev.datetime, ev.venue, ev.account ? '@' + ev.account : ''].filter(Boolean).join(' · ');
       if (ev.link) li.querySelector('a').href = ev.link;
       ul.appendChild(li);
     });
+  }
+
+  function setCategories(list) {
+    state.categories = list || [];
+    var dl = $('catList'); dl.innerHTML = '';
+    state.categories.forEach(function (c) { var o = document.createElement('option'); o.value = c; dl.appendChild(o); });
+    renderChips();
+  }
+
+  function renderChips() {
+    var box = $('catChips'), cur = document.querySelector('[data-f="category"]').value.trim();
+    box.innerHTML = '';
+    state.categories.slice(0, 14).forEach(function (c) {
+      var b = document.createElement('button'); b.type = 'button'; b.textContent = c;
+      if (c === cur) b.className = 'on';
+      b.onclick = function () { document.querySelector('[data-f="category"]').value = c; renderChips(); renderPreview(); };
+      box.appendChild(b);
+    });
+  }
+
+  function renderMapping(m) {
+    if (!m) return;
+    var body = $('mapBody'); body.innerHTML = '';
+    var p = document.createElement('p');
+    p.textContent = "'" + m.sheet + "' 시트 " + m.headerRow + '행 머리글에 맞춰 저장돼요.';
+    body.appendChild(p);
+    var t = document.createElement('table');
+    m.columns.forEach(function (c) {
+      var tr = t.insertRow();
+      tr.insertCell().textContent = c.col + '열';
+      tr.insertCell().textContent = c.header + (c.header.replace(/\s/g, '') !== c.field.replace(/\s/g, '') ? '  ← ' + c.field : '');
+    });
+    body.appendChild(t);
+    var HELPERS = ['링크', '포스터', '발행호'];
+    var skipped = m.missing.filter(function (x) { return HELPERS.indexOf(x) < 0; });
+    var added = m.missing.filter(function (x) { return HELPERS.indexOf(x) >= 0; });
+    if (skipped.length) addP('시트에 열이 없어 저장하지 않는 항목: ' + skipped.join(', '));
+    if (added.length) addP(added.join('·') + ' 열은 첫 저장 때 시트 오른쪽 끝에 자동으로 추가돼요.');
+    if (m.unmapped.length) addP('비워두는 열: ' + m.unmapped.join(', '));
+    function addP(text) { var el = document.createElement('p'); el.textContent = text; body.appendChild(el); }
   }
 
   /* ───────── 1단계: 입력 ───────── */
@@ -413,6 +479,7 @@
       .then(function (r) {
         loading(false);
         state.event = r.event;
+        if (r.categories) setCategories(r.categories);
         fillResult(r);
         state.mode = 'result'; updateMain();
         show($('resultCard'), true);
@@ -425,11 +492,12 @@
 
   function fillResult(r) {
     var ev = r.event;
-    var important = ['host', 'account', 'title', 'startDate', 'venue', 'region', 'details'];
+    var important = ['category', 'host', 'account', 'title', 'startDate', 'venue', 'region', 'summary'];
     fields().forEach(function (el) { el.value = ev[el.dataset.f] || ''; });
     document.querySelectorAll('[data-k]').forEach(function (box) {
       box.classList.toggle('missing', important.indexOf(box.dataset.k) >= 0 && !ev[box.dataset.k]);
     });
+    renderChips();
     note($('dupNote'), r.duplicate ? '이미 등록된 링크예요: ' + r.duplicate.issue + ' 호 「' + r.duplicate.title + '」' : '', 'warn');
     renderPreview();
   }
@@ -444,13 +512,18 @@
   function renderPreview() {
     var ev = readForm();
     $('pvTitle').textContent = ev.title || '(행사명)';
+    $('pvCat').textContent = ev.category || '';
     $('pvDate').textContent = '일시 · ' + (fmtDateTime(ev, false) || '미정');
     $('pvVenue').textContent = '장소 · ' + (ev.venue || '미정');
     var end = parseYmd(ev.endDate || ev.startDate), issue = parseYmd(ev.issue);
     note($('pastNote'), end && issue && end < issue ? '행사가 발행일(' + fmtDay(issue) + ') 전에 끝나요. 발행호를 확인해주세요.' : '', 'warn');
   }
 
-  document.addEventListener('input', function (e) { if (e.target.dataset && e.target.dataset.f) renderPreview(); });
+  document.addEventListener('input', function (e) {
+    if (!e.target.dataset || !e.target.dataset.f) return;
+    renderPreview();
+    if (e.target.dataset.f === 'category') renderChips();
+  });
 
   /* ───────── 3단계: 저장 ───────── */
   function save() {
