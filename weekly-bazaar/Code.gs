@@ -22,10 +22,15 @@ var CONFIG = {
   LIST_SHEET: '바자가자',
   LIST_SHEET_POSITION: 5, // 이름으로 못 찾으면 5번째 시트 사용
   WEEKLY_SHEET: '주간바자 정리',
+  FIGMA_SHEET: '피그마용',
+  // 목요일 발행호가 다루는 주: 0 = 발행일이 속한 월~일, 1 = 발행 다음 주 월~일
+  ISSUE_WEEK_OFFSET: 0,
+  WEEKLY_PAST_WEEKS: 2, // '주간바자 정리'에 남겨둘 지난 주 수
   POSTER_FOLDER: '주간바자 포스터',
   PRIMARY: '#0BD7ED',
   PUBLISH_WEEKDAY: 4, // 목요일. 목요일에 등록한 행사는 다음 주 발행호로 넘어갑니다.
-  GEMINI_MODELS: ['gemini-flash-latest', 'gemini-2.5-flash'],
+  // 앞에서부터 차례로 시도. 구글이 모델을 바꾸면 이 목록만 고치면 됩니다.
+  GEMINI_MODELS: ['gemini-flash-latest', 'gemini-3.8-flash', 'gemini-flash-lite-latest'],
   CLAUDE_MODEL: 'claude-opus-5',
   DEFAULT_CATEGORIES: ['플리마켓', '바자회', '벼룩시장', '축제/페스티벌', '팝업스토어', '전시', '공연', '체험/워크숍', '기타']
 };
@@ -86,16 +91,18 @@ function onEdit(e) {
 
 /* ───────────────────────── 클라이언트 호출 API ───────────────────────── */
 
-/** 첫 화면 데이터: 이번 발행호 행사 목록, 카테고리, 시트 연결 상태 */
+/** 첫 화면 데이터: 다음 발행호가 다루는 주(월~일)의 행사, 카테고리, 시트 연결 상태 */
 function getDashboard(passcode) {
   checkPasscode_(passcode);
   var ss = getSpreadsheet_();
   var ctx = listContext_(ss);
   var issue = issueFor_(new Date());
-  var events = readEvents_(ctx).filter(function (ev) { return ev.issueKey === issue; });
+  var week = weekOfIssue_(issue);
+  var events = eventsInWeek_(readEvents_(ctx), week);
   return {
     issue: issue,
     issueLabel: formatIssue_(issue),
+    weekLabel: formatWeek_(week),
     events: events.map(function (ev) {
       return { title: ev.title, datetime: ev.datetime, venue: ev.venue, link: ev.link, account: ev.account, category: ev.category };
     }),
@@ -449,7 +456,11 @@ function readEvents_(ctx) {
     ev.account = ev.account.replace(/^@/, '');
     ev.issueKey = normalizeDate_(ev.issue) || ev.issue;
     ev.issueLabel = parseYmd_(ev.issueKey) ? formatIssue_(ev.issueKey) : ev.issue;
-    ev.sortKey = firstDate_(ev.datetime, ev.issueKey) || '9999';
+    var yearHint = (parseYmd_(ev.issueKey) ? ev.issueKey : normalizeDate_(ev.registeredAt) || '').slice(0, 4);
+    var range = dateRange_(ev.datetime, yearHint);
+    ev.startKey = range ? range.start : '';
+    ev.endKey = range ? range.end : '';
+    ev.sortKey = ev.startKey || '9999';
     return ev;
   }).filter(function (ev) { return ev.title || ev.link; });
 }
@@ -457,21 +468,39 @@ function readEvents_(ctx) {
 /* ───────────────────────── 주간바자 정리 시트 ───────────────────────── */
 
 /**
- * '주간바자 정리' 시트를 '바자가자' 기준으로 새로 그립니다. (발행호가 적힌 행사만)
- * 왼쪽(A~G): 발행호별 행사 목록 / 오른쪽(I~L): 디자인용 행사명·일시·장소
+ * '주간바자 정리' 시트를 '바자가자' 기준으로 새로 그립니다.
+ * 행사 일시를 보고 월~일 한 주 단위로 묶습니다. 여러 주에 걸친 행사는 걸친 주마다 들어가요.
+ * 순서: 다음 발행호의 주부터 앞으로의 주 → 지난 주(최근 WEEKLY_PAST_WEEKS주)
+ * 왼쪽(A~G): 그 주 행사 목록 / 오른쪽(I~L): 디자인용 행사명·일시·장소
+ * 함께 '피그마용' 시트(다음 발행호 행사만, 한 줄에 하나)도 갱신합니다.
  */
 function rebuildWeeklySheet(ssArg) {
   var ss = ssArg && ssArg.getSheets ? ssArg : getSpreadsheet_();
   var ctx = listContext_(ss);
   var weekly = ss.getSheetByName(CONFIG.WEEKLY_SHEET) || ss.insertSheet(CONFIG.WEEKLY_SHEET, ss.getNumSheets());
-  var events = readEvents_(ctx).filter(function (ev) { return ev.issueKey; });
+  var all = readEvents_(ctx);
 
-  var groups = {}, labels = {};
-  events.forEach(function (ev) {
-    (groups[ev.issueKey] = groups[ev.issueKey] || []).push(ev);
-    labels[ev.issueKey] = ev.issueLabel;
+  var issueWeek = weekOfIssue_(issueFor_(new Date()));
+  var oldest = addDays_(mondayOf_(ymd_(new Date())), -7 * CONFIG.WEEKLY_PAST_WEEKS);
+
+  var groups = {};
+  var undated = [];
+  all.forEach(function (ev) {
+    if (!ev.startKey) {
+      // 날짜를 못 읽었지만 최근 발행호로 등록된 행사는 따로 모아 보여줌
+      if (parseYmd_(ev.issueKey) && ev.issueKey >= oldest) undated.push(ev);
+      return;
+    }
+    var from = mondayOf_(ev.startKey), to = mondayOf_(ev.endKey || ev.startKey);
+    if (from < oldest) from = oldest;
+    for (var w = from, n = 0; w <= to && n < 12; w = addDays_(w, 7), n++) {
+      (groups[w] = groups[w] || []).push(ev);
+    }
   });
-  var issues = Object.keys(groups).sort().reverse(); // 최신 발행호가 위로
+
+  var upcoming = Object.keys(groups).filter(function (w) { return w >= issueWeek; }).sort();
+  var past = Object.keys(groups).filter(function (w) { return w < issueWeek; }).sort().reverse();
+  var weeks = upcoming.concat(past);
 
   weekly.clear();
   weekly.getRange(1, 1, weekly.getMaxRows(), weekly.getMaxColumns()).breakApart();
@@ -481,12 +510,8 @@ function rebuildWeeklySheet(ssArg) {
   var WIDTH = LEFT.length + 1 + RIGHT.length;
   var values = [], styles = [];
   function pad(arr) { while (arr.length < WIDTH) arr.push(''); return arr; }
-
-  if (!issues.length) values.push(pad(['아직 발행호가 적힌 행사가 없어요. 웹앱에서 행사를 추가하면 여기에 주별로 정리돼요.']));
-
-  issues.forEach(function (issue) {
-    var list = groups[issue].slice().sort(function (a, b) { return a.sortKey.localeCompare(b.sortKey); });
-    values.push(pad([labels[issue] + ' 주간바자 · ' + list.length + '건']));
+  function block(title, list) {
+    values.push(pad([title]));
     styles.push({ row: values.length, kind: 'issue' });
     values.push(LEFT.concat([''], RIGHT));
     styles.push({ row: values.length, kind: 'header' });
@@ -497,10 +522,19 @@ function rebuildWeeklySheet(ssArg) {
         d.title, d.datetime, d.venue, [d.title, d.datetime, d.venue].filter(String).join('\n')]);
     });
     values.push(pad([]));
-  });
+  }
 
-  var all = weekly.getRange(1, 1, values.length, WIDTH);
-  all.setNumberFormat('@').setValues(values).setVerticalAlignment('middle').setWrap(true);
+  if (!weeks.length && !undated.length) values.push(pad(['아직 정리할 행사가 없어요. 웹앱에서 행사를 추가하면 여기에 월~일 주별로 정리돼요.']));
+
+  weeks.forEach(function (w) {
+    var list = sortEvents_(groups[w]);
+    var tag = w === issueWeek ? '  ◀ 다음 발행' : '';
+    block(formatWeek_(w) + ' · ' + formatIssue_(issueOfWeek_(w)) + ' 주간바자 · ' + list.length + '건' + tag, list);
+  });
+  if (undated.length) block('날짜 확인 필요 · 일시를 읽지 못한 행사 ' + undated.length + '건', undated);
+
+  var range = weekly.getRange(1, 1, values.length, WIDTH);
+  range.setNumberFormat('@').setValues(values).setVerticalAlignment('middle').setWrap(true);
 
   styles.forEach(function (s) {
     if (s.kind === 'issue') {
@@ -512,6 +546,42 @@ function rebuildWeeklySheet(ssArg) {
     }
   });
   [36, 100, 220, 130, 210, 180, 100, 16, 200, 170, 160, 260].forEach(function (w, i) { weekly.setColumnWidth(i + 1, w); });
+
+  rebuildFigmaSheet_(ss, sortEvents_(groups[issueWeek] || []), issueWeek);
+}
+
+/**
+ * '피그마용' 시트: 다음 발행호 주의 행사만, 1행 머리글 + 한 줄에 행사 하나.
+ * 피그마 플러그인(구글 시트 연동)이나 Claude가 그대로 읽기 좋은 모양입니다.
+ */
+function rebuildFigmaSheet_(ss, list, week) {
+  var sheet = ss.getSheetByName(CONFIG.FIGMA_SHEET) || ss.insertSheet(CONFIG.FIGMA_SHEET, ss.getNumSheets());
+  var header = ['번호', '행사명', '일시', '장소', '카테고리', '지역', '계정', '포스터', '발행호', '기간'];
+  var rows = [header];
+  list.forEach(function (ev, i) {
+    var d = formatDesign_(ev);
+    rows.push([String(i + 1), d.title, d.datetime, d.venue, ev.category, ev.region,
+      ev.account ? '@' + ev.account : '', ev.poster, formatIssue_(issueOfWeek_(week)), formatWeek_(week)]);
+  });
+  sheet.clear();
+  sheet.getRange(1, 1, rows.length, header.length).setNumberFormat('@').setValues(rows).setVerticalAlignment('middle');
+  sheet.getRange(1, 1, 1, header.length).setBackground(CONFIG.PRIMARY).setFontColor('#001417').setFontWeight('bold');
+  sheet.setFrozenRows(1);
+  [48, 220, 200, 180, 100, 100, 130, 200, 110, 170].forEach(function (w, i) { sheet.setColumnWidth(i + 1, w); });
+}
+
+function sortEvents_(list) {
+  return list.slice().sort(function (a, b) {
+    return a.sortKey.localeCompare(b.sortKey) || String(a.title).localeCompare(String(b.title));
+  });
+}
+
+/** 주(월요일 key)와 기간이 겹치는 행사 */
+function eventsInWeek_(events, week) {
+  var sunday = addDays_(week, 6);
+  return sortEvents_(events.filter(function (ev) {
+    return ev.startKey && ev.startKey <= sunday && (ev.endKey || ev.startKey) >= week;
+  }));
 }
 
 /* ───────────────────────── AI 호출 ───────────────────────── */
@@ -583,10 +653,11 @@ function callGemini_(input, prompt) {
     generationConfig: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.2 }
   });
 
-  var models = prop_('AI_MODEL') ? [prop_('AI_MODEL')] : CONFIG.GEMINI_MODELS;
-  var lastErr = '';
+  var models = (prop_('AI_MODEL') ? [prop_('AI_MODEL')] : []).concat(CONFIG.GEMINI_MODELS)
+    .filter(function (m, i, a) { return a.indexOf(m) === i; });
+  var errors = [], limited = 0;
   for (var i = 0; i < models.length; i++) {
-    for (var attempt = 0; attempt < 2; attempt++) {
+    for (var attempt = 0; attempt < 3; attempt++) {
       var res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + models[i] + ':generateContent', {
         method: 'post',
         contentType: 'application/json',
@@ -595,19 +666,21 @@ function callGemini_(input, prompt) {
         muteHttpExceptions: true
       });
       var code = res.getResponseCode();
-      var json = JSON.parse(res.getContentText() || '{}');
+      var json;
+      try { json = JSON.parse(res.getContentText() || '{}'); } catch (e) { json = {}; }
       if (code === 200) {
         var cand = json.candidates && json.candidates[0];
         if (!cand || !cand.content) throw new Error('AI가 답을 주지 않았어요. (' + ((cand && cand.finishReason) || '빈 응답') + ')');
         return JSON.parse(cand.content.parts.map(function (p) { return p.text || ''; }).join(''));
       }
-      lastErr = (json.error && json.error.message) || ('HTTP ' + code);
-      if (code === 429) throw new Error('무료 사용 한도(분당 요청 수)를 넘었어요. 1분 뒤에 다시 눌러주세요.');
-      if (code === 503 || code === 500) { Utilities.sleep(2000); continue; } // 일시적 과부하 → 한 번 더
-      break; // 404(모델 없음) 등은 다음 모델로
+      if ((code === 503 || code === 500) && attempt < 2) { Utilities.sleep(2000 * (attempt + 1)); continue; } // 일시적 과부하
+      if (code === 429) limited++;
+      errors.push(models[i] + ': ' + ((json.error && json.error.message) || ('HTTP ' + code)));
+      break; // 한도 초과·모델 없음 등은 다음 모델로
     }
   }
-  throw new Error('Gemini API 오류: ' + lastErr);
+  if (limited === models.length) throw new Error('무료 사용 한도를 넘었어요. 1분 뒤에 다시 눌러주세요. (하루 한도라면 내일 다시)');
+  throw new Error('Gemini API 오류 — ' + errors.join(' / '));
 }
 
 /** Claude (유료, 선택) */
@@ -664,14 +737,55 @@ function normalizeDate_(s) {
   return m ? m[1] + '-' + pad2_(+m[2]) + '-' + pad2_(+m[3]) : '';
 }
 
-/** 일시 문자열에서 첫 날짜를 찾아 정렬용 YYYY-MM-DD로 (연도가 없으면 발행호 연도) */
-function firstDate_(text, issueKey) {
-  var full = normalizeDate_(text);
-  if (full) return full;
-  var m = String(text || '').match(/(\d{1,2})\s*[.\/월]\s*(\d{1,2})/);
-  if (!m) return '';
-  var year = (issueKey || '').slice(0, 4) || String(new Date().getFullYear());
-  return year + '-' + pad2_(+m[1]) + '-' + pad2_(+m[2]);
+/**
+ * 일시 문자열에서 시작일·종료일을 찾습니다. 연도가 없으면 yearHint(발행호/등록일 연도) 사용.
+ * 예: '2026.10.03(토) ~ 10.05(월) 11:00~18:00' → {start:'2026-10-03', end:'2026-10-05'}
+ *     '10/3~10/5', '10월 3일', '2026-12-30 ~ 2027-01-02' 도 읽어요.
+ */
+function dateRange_(text, yearHint) {
+  var re = /(?:(\d{4})\s*[.\-\/년]\s*)?(\d{1,2})\s*[.\-\/월]\s*(\d{1,2})(?!\d)/g;
+  var hint = +yearHint || +Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy');
+  var dates = [], m, prev = null;
+  while ((m = re.exec(String(text || ''))) !== null) {
+    var mo = +m[2], d = +m[3];
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) continue;
+    var y = m[1] ? +m[1] : prev ? prev.y + (mo < prev.mo ? 1 : 0) : hint;
+    prev = { y: y, mo: mo };
+    dates.push(y + '-' + pad2_(mo) + '-' + pad2_(d));
+  }
+  if (!dates.length) return null;
+  var end = dates[dates.length - 1];
+  return { start: dates[0], end: end >= dates[0] ? end : dates[0] };
+}
+
+function ymd_(date) { return Utilities.formatDate(date, 'Asia/Seoul', 'yyyy-MM-dd'); }
+
+function addDays_(key, n) {
+  var d = parseYmd_(key);
+  d.setDate(d.getDate() + n);
+  return d.getFullYear() + '-' + pad2_(d.getMonth() + 1) + '-' + pad2_(d.getDate());
+}
+
+/** 그 날짜가 속한 주의 월요일 (YYYY-MM-DD) */
+function mondayOf_(key) {
+  var d = parseYmd_(key);
+  return addDays_(key, -((d.getDay() + 6) % 7));
+}
+
+/** 목요일 발행호가 다루는 주의 월요일 */
+function weekOfIssue_(issue) {
+  return addDays_(mondayOf_(issue), 7 * CONFIG.ISSUE_WEEK_OFFSET);
+}
+
+/** 주(월요일)를 다루는 목요일 발행호 */
+function issueOfWeek_(week) {
+  return addDays_(week, 3 - 7 * CONFIG.ISSUE_WEEK_OFFSET);
+}
+
+/** 2026.09.28(월) ~ 10.04(일) */
+function formatWeek_(week) {
+  var s = parseYmd_(week), e = parseYmd_(addDays_(week, 6));
+  return fmtDay_(s, true) + ' ~ ' + fmtDay_(e, s.getFullYear() !== e.getFullYear());
 }
 
 function formatIssue_(issue) {

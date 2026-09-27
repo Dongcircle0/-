@@ -129,6 +129,7 @@
   .mapping td { padding: 5px 4px; border-bottom: 1px solid var(--line); vertical-align: top; }
   .mapping td:first-child { color: var(--primary); font-weight: 800; width: 44px; }
   .mapping p { margin: 8px 0 0; }
+  .sub { display: block; font-size: 12.5px; font-weight: 500; color: var(--muted); }
   .hidden { display: none !important; }
   a.sheet { color: var(--primary); font-size: 13px; font-weight: 700; text-decoration: none; }
 </style>
@@ -237,7 +238,7 @@
     <!-- 3. 이번 발행호 -->
     <section class="card">
       <h2 style="justify-content: space-between">
-        <span style="display:flex;gap:8px;align-items:center"><span class="num">3</span><span id="listTitle">이번 주간바자</span></span>
+        <span style="display:flex;gap:8px;align-items:center"><span class="num">3</span><span><span id="listTitle">이번 주간바자</span><small id="listSub" class="sub"></small></span></span>
         <a class="sheet" id="sheetLink" target="_blank" rel="noopener">시트 열기 ↗</a>
       </h2>
       <ul class="list" id="list"></ul>
@@ -343,11 +344,12 @@
   function renderDashboard(d) {
     $('issueChip').textContent = d.issueLabel + ' 발행 · ' + d.events.length + '건';
     $('listTitle').textContent = d.issueLabel + ' 주간바자';
+    $('listSub').textContent = (d.weekLabel || '') + ' 행사';
     $('sheetLink').href = d.sheetUrl;
     setCategories(d.categories);
     renderMapping(d.mapping);
     var ul = $('list'); ul.innerHTML = '';
-    if (!d.events.length) { ul.innerHTML = '<li class="empty">아직 이번 호에 등록된 행사가 없어요.</li>'; return; }
+    if (!d.events.length) { ul.innerHTML = '<li class="empty">아직 이 주(월~일)에 열리는 행사가 없어요.</li>'; return; }
     d.events.forEach(function (ev) {
       var li = document.createElement('li');
       li.innerHTML = '<div><span class="c"></span><span class="t"></span></div><div class="m"></div>' + (ev.link ? '<a target="_blank" rel="noopener">게시물 보기 ↗</a>' : '');
