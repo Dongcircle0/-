@@ -98,7 +98,11 @@ function getDashboard(passcode) {
   var ctx = listContext_(ss);
   var issue = issueFor_(new Date());
   var week = weekOfIssue_(issue);
-  var events = eventsInWeek_(readEvents_(ctx), week);
+  var all = readEvents_(ctx);
+  var events = eventsInWeek_(all, week);
+  // 화면에서 바로 중복 확인할 수 있게 등록된 링크 목록도 보냄
+  var links = {};
+  all.forEach(function (ev) { if (ev.link) links[cleanLink_(ev.link)] = { title: ev.title, issue: ev.issueLabel }; });
   return {
     issue: issue,
     issueLabel: formatIssue_(issue),
@@ -106,6 +110,7 @@ function getDashboard(passcode) {
     events: events.map(function (ev) {
       return { title: ev.title, datetime: ev.datetime, venue: ev.venue, link: ev.link, account: ev.account, category: ev.category };
     }),
+    links: links,
     categories: categoryOptions_(ctx),
     mapping: mappingSummary_(ctx),
     sheetUrl: ss.getUrl() + '#gid=' + ctx.sheet.getSheetId()
@@ -173,7 +178,7 @@ function fetchInstagram(passcode, url) {
  * AI로 행사 정보 정리.
  * @param {{link:string, caption:string, image:{mimeType:string,data:string}|null}} input
  */
-function analyzeEvent(passcode, input, opts) {
+function analyzeEvent(passcode, input) {
   checkPasscode_(passcode);
   if (!input || (!input.caption && !input.image)) {
     throw new Error('캡션이나 포스터 중 하나는 꼭 넣어주세요.');
@@ -185,26 +190,18 @@ function analyzeEvent(passcode, input, opts) {
   var urlAccount = accountFromUrl_(input.link);
   var prompt = buildPrompt_(input, today, urlAccount, categories);
 
-  // opts.basic: AI 없이 캡션에서 찾을 수 있는 것만 바로 채움 (화면은 이걸 먼저 보여주고 AI를 뒤에서 돌림)
-  var basic = !!(opts && opts.basic);
-  var data = basic ? basicExtract_(input, categories)
-    : (prop_('AI_PROVIDER') || 'gemini').toLowerCase() === 'claude'
-      ? callClaude_(input, prompt)
-      : callGemini_(input, prompt);
+  var data = (prop_('AI_PROVIDER') || 'gemini').toLowerCase() === 'claude'
+    ? callClaude_(input, prompt)
+    : callGemini_(input, prompt);
 
-  var sure = data.sure || [];
   var ev = normalizeEvent_(data);
   if (!ev.account && urlAccount) ev.account = urlAccount;
   ev.link = cleanLink_(input.link);
   ev.issue = issueFor_(new Date());
 
-  var dup = ev.link ? readEvents_(ctx).filter(function (x) { return x.link && cleanLink_(x.link) === ev.link; })[0] : null;
   return {
     event: ev,
-    basic: basic,
-    sure: sure, // 캡션에 '주최: ○○'처럼 명확히 적혀 있던 칸 → AI가 덮어쓰지 않음
-    categories: categories,
-    duplicate: dup ? { title: dup.title, issue: dup.issueLabel } : null
+    categories: categories
   };
 }
 
@@ -236,7 +233,13 @@ function saveEvent(passcode, ev, image) {
   } finally {
     lock.releaseLock();
   }
-  rebuildWeeklySheet(ss);
+  return { ok: true };
+}
+
+/** 저장 뒤 화면이 기다리지 않고 따로 부르는 함수: 주간·피그마용 시트 갱신 후 첫 화면 데이터 */
+function finishSave(passcode) {
+  checkPasscode_(passcode);
+  rebuildWeeklySheet(getSpreadsheet_());
   return getDashboard(passcode);
 }
 
@@ -695,57 +698,6 @@ function callGemini_(input, prompt) {
   Logger.log('Gemini 실패: %s', errors.join(' / '));
   if (busy > 0) throw new Error('AI_BUSY: 구글 AI가 지금 붐벼요. 잠시 뒤 다시 시도해주세요.');
   throw new Error('AI 정리에 실패했어요. 모델 이름이나 API 키를 확인해주세요. (' + errors.join(' / ').slice(0, 300) + ')');
-}
-
-/**
- * AI 없이 캡션 글자만 보고 기본 정보를 뽑습니다. (AI가 계속 붐빌 때 비상용)
- * '주최 : ○○', '장소: ○○', '📍○○', 날짜·시간 형식을 찾아요. 못 찾은 칸은 비워둡니다.
- */
-function basicExtract_(input, categories) {
-  var caption = String(input.caption || '');
-  var lines = caption.split(/\n+/).map(function (l) { return l.trim(); }).filter(String);
-  var clean = function (t) {
-    return String(t || '').replace(/#[^\s#]+/g, '').replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '').replace(/\s+/g, ' ').trim();
-  };
-  function labeled(words) {
-    var re = new RegExp('^[\\s\\-•·▪▶︎>*]*(?:' + words.join('|') + ')\\s*[:：\\]\\)]?\\s*(.+)$');
-    for (var i = 0; i < lines.length; i++) {
-      var m = clean(lines[i]).replace(/^[\[(【<]/, '').match(re);
-      if (m) return m[1].replace(/^[:：\s]+/, '').trim();
-    }
-    return '';
-  }
-  var ev = {};
-  ev.host = labeled(['주최']);
-  ev.organizer = labeled(['주관']);
-  ev.sponsor = labeled(['후원', '협찬']);
-  ev.venue = labeled(['장소', '위치', '행사장소']);
-  if (!ev.venue) {
-    var pin = lines.filter(function (l) { return l.indexOf('📍') >= 0; })[0];
-    if (pin) ev.venue = clean(pin.split('📍')[1]);
-  }
-  var labeledDate = labeled(['일시', '일정', '기간', '날짜', '행사일시', '행사기간']);
-  var dateText = labeledDate || caption;
-  var range = dateRange_(dateText, Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy'));
-  ev.startDate = range ? range.start : '';
-  ev.endDate = range ? range.end : '';
-  var t = dateText.match(/(\d{1,2}:\d{2})\s*[~\-–]\s*(\d{1,2}:\d{2})/) || dateText.match(/(\d{1,2}:\d{2})/);
-  ev.time = t ? (t[2] ? t[1] + '~' + t[2] : t[1]) : '';
-  var reg = (ev.venue + ' ' + caption).match(/(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)[^\s]*\s+([가-힣]+?[시군구])(?![가-힣])/);
-  ev.region = reg ? reg[1] + ' ' + reg[2] : '';
-  var mention = caption.match(/@([A-Za-z0-9._]+)/);
-  ev.account = accountFromUrl_(input.link) || (mention ? mention[1] : '');
-  ev.title = clean(lines.filter(function (l) { return clean(l).length > 1; })[0] || '').replace(/^[\[【<]+|[\]】>]+$/g, '').slice(0, 80);
-  ev.category = (categories || []).filter(function (c) { return c && caption.indexOf(c) >= 0; })[0] || '';
-  ev.summary = '';
-  ev.details = lines.slice(1).map(clean).filter(function (l) { return l.length > 1; }).slice(0, 8).join('\n');
-  ev.dateNote = '';
-  ev.missing = [];
-  ev.sure = ['host', 'organizer', 'sponsor', 'venue'].filter(function (k) { return ev[k]; });
-  if (labeledDate && range) ev.sure.push('startDate', 'endDate');
-  if (labeledDate && ev.time) ev.sure.push('time');
-  if (accountFromUrl_(input.link)) ev.sure.push('account');
-  return ev;
 }
 
 /** Claude (유료, 선택) */
