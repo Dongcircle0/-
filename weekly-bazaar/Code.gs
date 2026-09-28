@@ -185,13 +185,14 @@ function analyzeEvent(passcode, input, opts) {
   var urlAccount = accountFromUrl_(input.link);
   var prompt = buildPrompt_(input, today, urlAccount, categories);
 
-  // opts.basic: AI가 계속 붐빌 때 화면에서 요청 → AI 없이 캡션에서 찾을 수 있는 것만 채움
+  // opts.basic: AI 없이 캡션에서 찾을 수 있는 것만 바로 채움 (화면은 이걸 먼저 보여주고 AI를 뒤에서 돌림)
   var basic = !!(opts && opts.basic);
   var data = basic ? basicExtract_(input, categories)
     : (prop_('AI_PROVIDER') || 'gemini').toLowerCase() === 'claude'
       ? callClaude_(input, prompt)
       : callGemini_(input, prompt);
 
+  var sure = data.sure || [];
   var ev = normalizeEvent_(data);
   if (!ev.account && urlAccount) ev.account = urlAccount;
   ev.link = cleanLink_(input.link);
@@ -201,6 +202,7 @@ function analyzeEvent(passcode, input, opts) {
   return {
     event: ev,
     basic: basic,
+    sure: sure, // 캡션에 '주최: ○○'처럼 명확히 적혀 있던 칸 → AI가 덮어쓰지 않음
     categories: categories,
     duplicate: dup ? { title: dup.title, issue: dup.issueLabel } : null
   };
@@ -722,7 +724,8 @@ function basicExtract_(input, categories) {
     var pin = lines.filter(function (l) { return l.indexOf('📍') >= 0; })[0];
     if (pin) ev.venue = clean(pin.split('📍')[1]);
   }
-  var dateText = labeled(['일시', '일정', '기간', '날짜', '행사일시', '행사기간']) || caption;
+  var labeledDate = labeled(['일시', '일정', '기간', '날짜', '행사일시', '행사기간']);
+  var dateText = labeledDate || caption;
   var range = dateRange_(dateText, Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy'));
   ev.startDate = range ? range.start : '';
   ev.endDate = range ? range.end : '';
@@ -738,6 +741,10 @@ function basicExtract_(input, categories) {
   ev.details = lines.slice(1).map(clean).filter(function (l) { return l.length > 1; }).slice(0, 8).join('\n');
   ev.dateNote = '';
   ev.missing = [];
+  ev.sure = ['host', 'organizer', 'sponsor', 'venue'].filter(function (k) { return ev[k]; });
+  if (labeledDate && range) ev.sure.push('startDate', 'endDate');
+  if (labeledDate && ev.time) ev.sure.push('time');
+  if (accountFromUrl_(input.link)) ev.sure.push('account');
   return ev;
 }
 
