@@ -173,7 +173,7 @@ function fetchInstagram(passcode, url) {
  * AI로 행사 정보 정리.
  * @param {{link:string, caption:string, image:{mimeType:string,data:string}|null}} input
  */
-function analyzeEvent(passcode, input) {
+function analyzeEvent(passcode, input, opts) {
   checkPasscode_(passcode);
   if (!input || (!input.caption && !input.image)) {
     throw new Error('캡션이나 포스터 중 하나는 꼭 넣어주세요.');
@@ -185,9 +185,12 @@ function analyzeEvent(passcode, input) {
   var urlAccount = accountFromUrl_(input.link);
   var prompt = buildPrompt_(input, today, urlAccount, categories);
 
-  var data = (prop_('AI_PROVIDER') || 'gemini').toLowerCase() === 'claude'
-    ? callClaude_(input, prompt)
-    : callGemini_(input, prompt);
+  // opts.basic: AI가 계속 붐빌 때 화면에서 요청 → AI 없이 캡션에서 찾을 수 있는 것만 채움
+  var basic = !!(opts && opts.basic);
+  var data = basic ? basicExtract_(input, categories)
+    : (prop_('AI_PROVIDER') || 'gemini').toLowerCase() === 'claude'
+      ? callClaude_(input, prompt)
+      : callGemini_(input, prompt);
 
   var ev = normalizeEvent_(data);
   if (!ev.account && urlAccount) ev.account = urlAccount;
@@ -197,6 +200,7 @@ function analyzeEvent(passcode, input) {
   var dup = ev.link ? readEvents_(ctx).filter(function (x) { return x.link && cleanLink_(x.link) === ev.link; })[0] : null;
   return {
     event: ev,
+    basic: basic,
     categories: categories,
     duplicate: dup ? { title: dup.title, issue: dup.issueLabel } : null
   };
@@ -655,9 +659,10 @@ function callGemini_(input, prompt) {
 
   var models = (prop_('AI_MODEL') ? [prop_('AI_MODEL')] : []).concat(CONFIG.GEMINI_MODELS)
     .filter(function (m, i, a) { return a.indexOf(m) === i; });
-  var errors = [], limited = 0;
+  var started = Date.now();
+  var errors = [], busy = 0;
   for (var i = 0; i < models.length; i++) {
-    for (var attempt = 0; attempt < 3; attempt++) {
+    for (var attempt = 0; attempt < 2; attempt++) {
       var res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + models[i] + ':generateContent', {
         method: 'post',
         contentType: 'application/json',
@@ -670,17 +675,70 @@ function callGemini_(input, prompt) {
       try { json = JSON.parse(res.getContentText() || '{}'); } catch (e) { json = {}; }
       if (code === 200) {
         var cand = json.candidates && json.candidates[0];
-        if (!cand || !cand.content) throw new Error('AI가 답을 주지 않았어요. (' + ((cand && cand.finishReason) || '빈 응답') + ')');
-        return JSON.parse(cand.content.parts.map(function (p) { return p.text || ''; }).join(''));
+        if (cand && cand.content) {
+          try { return JSON.parse(cand.content.parts.map(function (p) { return p.text || ''; }).join('')); } catch (e) { /* 깨진 응답 → 다음 모델 */ }
+        }
+        errors.push(models[i] + ': 빈 응답');
+        break;
       }
-      if ((code === 503 || code === 500) && attempt < 2) { Utilities.sleep(2000 * (attempt + 1)); continue; } // 일시적 과부하
-      if (code === 429) limited++;
+      // 503/500 = 구글 쪽 일시 과부하, 429 = 무료 한도 → 둘 다 "붐빔"으로 취급
+      var overloaded = code === 503 || code === 500 || code === 429;
+      if (overloaded && attempt === 0 && Date.now() - started < 40000) { Utilities.sleep(3000); continue; }
+      if (overloaded) busy++;
       errors.push(models[i] + ': ' + ((json.error && json.error.message) || ('HTTP ' + code)));
-      break; // 한도 초과·모델 없음 등은 다음 모델로
+      break; // 모델 없음 등은 다음 모델로
     }
+    if (Date.now() - started > 60000) break; // 화면이 너무 오래 멈추지 않게
   }
-  if (limited === models.length) throw new Error('무료 사용 한도를 넘었어요. 1분 뒤에 다시 눌러주세요. (하루 한도라면 내일 다시)');
-  throw new Error('Gemini API 오류 — ' + errors.join(' / '));
+  Logger.log('Gemini 실패: %s', errors.join(' / '));
+  if (busy > 0) throw new Error('AI_BUSY: 구글 AI가 지금 붐벼요. 잠시 뒤 다시 시도해주세요.');
+  throw new Error('AI 정리에 실패했어요. 모델 이름이나 API 키를 확인해주세요. (' + errors.join(' / ').slice(0, 300) + ')');
+}
+
+/**
+ * AI 없이 캡션 글자만 보고 기본 정보를 뽑습니다. (AI가 계속 붐빌 때 비상용)
+ * '주최 : ○○', '장소: ○○', '📍○○', 날짜·시간 형식을 찾아요. 못 찾은 칸은 비워둡니다.
+ */
+function basicExtract_(input, categories) {
+  var caption = String(input.caption || '');
+  var lines = caption.split(/\n+/).map(function (l) { return l.trim(); }).filter(String);
+  var clean = function (t) {
+    return String(t || '').replace(/#[^\s#]+/g, '').replace(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}]/gu, '').replace(/\s+/g, ' ').trim();
+  };
+  function labeled(words) {
+    var re = new RegExp('^[\\s\\-•·▪▶︎>*]*(?:' + words.join('|') + ')\\s*[:：\\]\\)]?\\s*(.+)$');
+    for (var i = 0; i < lines.length; i++) {
+      var m = clean(lines[i]).replace(/^[\[(【<]/, '').match(re);
+      if (m) return m[1].replace(/^[:：\s]+/, '').trim();
+    }
+    return '';
+  }
+  var ev = {};
+  ev.host = labeled(['주최']);
+  ev.organizer = labeled(['주관']);
+  ev.sponsor = labeled(['후원', '협찬']);
+  ev.venue = labeled(['장소', '위치', '행사장소']);
+  if (!ev.venue) {
+    var pin = lines.filter(function (l) { return l.indexOf('📍') >= 0; })[0];
+    if (pin) ev.venue = clean(pin.split('📍')[1]);
+  }
+  var dateText = labeled(['일시', '일정', '기간', '날짜', '행사일시', '행사기간']) || caption;
+  var range = dateRange_(dateText, Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy'));
+  ev.startDate = range ? range.start : '';
+  ev.endDate = range ? range.end : '';
+  var t = dateText.match(/(\d{1,2}:\d{2})\s*[~\-–]\s*(\d{1,2}:\d{2})/) || dateText.match(/(\d{1,2}:\d{2})/);
+  ev.time = t ? (t[2] ? t[1] + '~' + t[2] : t[1]) : '';
+  var reg = (ev.venue + ' ' + caption).match(/(서울|부산|대구|인천|광주|대전|울산|세종|경기|강원|충북|충남|전북|전남|경북|경남|제주)[^\s]*\s+([가-힣]+?[시군구])(?![가-힣])/);
+  ev.region = reg ? reg[1] + ' ' + reg[2] : '';
+  var mention = caption.match(/@([A-Za-z0-9._]+)/);
+  ev.account = accountFromUrl_(input.link) || (mention ? mention[1] : '');
+  ev.title = clean(lines.filter(function (l) { return clean(l).length > 1; })[0] || '').replace(/^[\[【<]+|[\]】>]+$/g, '').slice(0, 80);
+  ev.category = (categories || []).filter(function (c) { return c && caption.indexOf(c) >= 0; })[0] || '';
+  ev.summary = '';
+  ev.details = lines.slice(1).map(clean).filter(function (l) { return l.length > 1; }).slice(0, 8).join('\n');
+  ev.dateNote = '';
+  ev.missing = [];
+  return ev;
 }
 
 /** Claude (유료, 선택) */

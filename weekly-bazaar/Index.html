@@ -113,8 +113,10 @@
   .overlay p { margin: 0; color: var(--text); font-weight: 700; text-align: center; }
   .overlay small { display: block; color: var(--muted); font-weight: 500; margin-top: 4px; }
 
+  .btn-skip { display: block; margin: 16px auto 0; background: none; border: 1px solid var(--primary-line); color: var(--primary); border-radius: 999px; padding: 9px 16px; font-weight: 700; font-size: 14px; }
   .toast { position: fixed; left: 50%; bottom: calc(92px + env(safe-area-inset-bottom)); transform: translate(-50%, 20px); opacity: 0;
-    background: var(--primary); color: var(--primary-ink); font-weight: 800; padding: 10px 16px; border-radius: 999px; transition: .25s; z-index: 60; white-space: nowrap; }
+    background: var(--primary); color: var(--primary-ink); font-weight: 800; padding: 10px 16px; border-radius: 16px; transition: .25s; z-index: 60;
+    width: max-content; max-width: min(92vw, 560px); text-align: center; line-height: 1.45; }
   .toast.on { opacity: 1; transform: translate(-50%, 0); }
 
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
@@ -188,6 +190,7 @@
     <!-- 2. 결과 -->
     <section class="card hidden" id="resultCard">
       <h2><span class="num">2</span>AI 정리 결과 확인</h2>
+      <div class="note warn hidden" id="basicNote"></div>
       <div class="note warn hidden" id="dupNote"></div>
       <div class="note warn hidden" id="pastNote"></div>
 
@@ -256,7 +259,8 @@
   </div>
 </div>
 
-<div class="overlay" id="overlay"><div><div class="spinner"></div><p id="overlayMsg">정리하는 중…<small></small></p></div></div>
+<div class="overlay" id="overlay"><div><div class="spinner"></div><p id="overlayMsg">정리하는 중…<small></small></p>
+  <button class="btn-skip hidden" id="skipBtn" type="button">기다리지 않고 캡션으로 바로 채우기</button></div></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -279,7 +283,8 @@
     });
   }
 
-  function errMsg(e) { return String((e && e.message) || e).replace(/^Error:\s*/, '').replace(/^PASSCODE:\s*/, ''); }
+  function errMsg(e) { return String((e && e.message) || e).replace(/^Error:\s*/, '').replace(/^(PASSCODE|AI_BUSY):\s*/, ''); }
+  function isBusy(e) { return /AI_BUSY/.test(String((e && e.message) || e)); }
 
   function loading(on, msg, sub) {
     $('overlay').classList.toggle('on', on);
@@ -289,7 +294,7 @@
   var toastTimer;
   function toast(msg) {
     var t = $('toast'); t.textContent = msg; t.classList.add('on');
-    clearTimeout(toastTimer); toastTimer = setTimeout(function () { t.classList.remove('on'); }, 2400);
+    clearTimeout(toastTimer); toastTimer = setTimeout(function () { t.classList.remove('on'); }, Math.max(2400, msg.length * 70));
   }
 
   function note(el, msg, kind) {
@@ -475,19 +480,53 @@
   };
 
   /* ───────── 2단계: AI 정리 ───────── */
-  function analyze() {
-    loading(true, 'AI가 행사 정보를 정리하는 중…', '포스터와 캡션을 읽고 있어요 (10~30초)');
-    call('analyzeEvent', { link: $('link').value.trim(), caption: $('caption').value.trim(), image: state.image })
+  // 구글 AI가 붐빌 때 자동으로 기다렸다가 다시 시도하는 간격(초)
+  var RETRY_WAITS = [15, 30, 45];
+  var retryTimer = null;
+
+  function analyze() { runAnalyze(0, false); }
+
+  function runAnalyze(attempt, basic) {
+    clearInterval(retryTimer);
+    show($('skipBtn'), false);
+    loading(true, basic ? '캡션에서 정보를 찾는 중…' : 'AI가 행사 정보를 정리하는 중…',
+      basic ? '' : attempt ? '다시 시도하는 중 (' + attempt + '/' + RETRY_WAITS.length + ')' : '포스터와 캡션을 읽고 있어요 (10~40초)');
+    var input = { link: $('link').value.trim(), caption: $('caption').value.trim(), image: state.image };
+    call('analyzeEvent', input, { basic: basic })
       .then(function (r) {
         loading(false);
-        state.event = r.event;
-        if (r.categories) setCategories(r.categories);
-        fillResult(r);
-        state.mode = 'result'; updateMain();
-        show($('resultCard'), true);
-        $('resultCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
+        showResult(r);
       })
-      .catch(function (e) { loading(false); toast(errMsg(e)); });
+      .catch(function (e) {
+        if (!basic && isBusy(e)) return waitAndRetry(attempt);
+        loading(false);
+        toast(errMsg(e));
+      });
+  }
+
+  /** AI가 붐비면 카운트다운 후 자동 재시도, 다 실패하면 캡션 기반 기본 정리 */
+  function waitAndRetry(attempt) {
+    if (attempt >= RETRY_WAITS.length) return runAnalyze(attempt, true);
+    var left = RETRY_WAITS[attempt];
+    function tick() {
+      loading(true, '구글 AI가 지금 붐벼요', left + '초 뒤에 자동으로 다시 시도해요 (' + (attempt + 1) + '/' + RETRY_WAITS.length + ')');
+      if (left-- <= 0) { clearInterval(retryTimer); runAnalyze(attempt + 1, false); }
+    }
+    show($('skipBtn'), true);
+    tick();
+    retryTimer = setInterval(tick, 1000);
+  }
+
+  $('skipBtn').onclick = function () { clearInterval(retryTimer); runAnalyze(RETRY_WAITS.length, true); };
+
+  function showResult(r) {
+    state.event = r.event;
+    if (r.categories) setCategories(r.categories);
+    fillResult(r);
+    note($('basicNote'), r.basic ? 'AI가 붐벼서 캡션에서 찾을 수 있는 정보만 채웠어요. 노란 칸을 확인해서 채운 뒤 저장해주세요. (잠시 뒤 "처음부터 다시"로 AI 정리를 다시 해도 돼요)' : '', 'warn');
+    state.mode = 'result'; updateMain();
+    show($('resultCard'), true);
+    $('resultCard').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   function fields() { return Array.prototype.slice.call(document.querySelectorAll('[data-f]')); }
